@@ -1,0 +1,605 @@
+---
+title: "Hotel Data Analysis"
+author: "Ani Aloyan"
+date: "2024-01-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+```{r, include=FALSE}
+library(dplyr)
+library(forecast)
+library(ggplot2)
+library(giscoR)
+library(gridExtra)
+library(lubridate)
+library(reshape2)
+library(sf)
+library(textdata)
+library(tidyr)
+library(tidytext)
+library(tm)
+library(wordcloud)
+library(ggpubr)
+```
+
+
+# Hotel Dataset 
+```{r}
+# Load the data
+hotels_data <- read.csv('booking_reviews copy.csv')
+
+# Count the number of reviews by hotel and sort them in descending order
+hotels_counts <- hotels_data %>%
+  count(hotel_name, sort = TRUE)
+
+# Select hotels that are at positions that are 7th (6 when zero-indexed) in every set of 8 hotels
+my_hotels <- hotels_counts %>%
+  filter((row_number() - 1) %% 8 == 6)  %>%
+  pull(hotel_name)
+
+# Filter the original dataset to include only rows that match the selected hotel names
+dff <- hotels_data %>%
+  filter(hotel_name %in% my_hotels)
+
+dff$reviewed_at <- dmy(dff$reviewed_at)
+
+```
+
+#Time Series with R
+
+The goal of the analysis done on our dataset is to investigate any patterns in the quantity of reviews over time. We concentrated on combining the reviews over time on a monthly basis to look for patterns or variations in the number of reviews.
+```{r}
+dff <- dff %>%
+  mutate(reviewed_month = floor_date(reviewed_at, "month")) 
+
+reviews_over_time <- dff %>%
+  group_by(reviewed_month) %>%
+  summarise(count = n())
+
+ggplot(data = reviews_over_time, aes(x = reviewed_month, y = count)) +
+  geom_line(color = "steelblue", size = 1) +
+  labs(title = "Number of Reviews Over Time",
+       x = "Date",
+       y = "Number of Reviews") +
+  theme_minimal()
+```
+
+The plotted graph provides a comprehensive overview of the temporal distribution of reviews from July 2018 to July 2021. The initial phase, from July 2018 to October 2018, witnessed an increase in the number of reviews, reaching approximately 120.
+A notable spike occurred in May 2019, leading to a peak of around 200 reviews in October 2019. However, after the peak, the system experienced fluctuations, possibly influenced by external factors such as the global COVID-19 pandemic; from February 2020 to April 2020, the reviews were nearly 0 (no one was in a hotel to write a review about). 
+After this time, the system showed signs of improvement, and in May 2021, there was an apparent increase in reviews. Between July 2020 and July 2021, the number of reviews reached a stable point, with a little decrease from November 2020 to February 2021, which can be because of the seasonal events and holidays.
+
+
+Analyzing TOP5 Hotels By Ratings
+```{r, warning=FALSE}
+# Divide ratings into categories
+bins <- c(0, 6, 7, 8, 9, 10)
+labels <- c('0-6', '6-7', '7-8', '8-9', '9-10')
+dff$rating_category <- cut(dff$rating, breaks=bins, labels=labels)
+dff$rating_category <- ordered(dff$rating_category,
+levels = c('0-6', '6-7', '7-8', '8-9', '9-10'))
+
+# Filter the hotels with the most reviews
+popular_hotel_names <- names(sort(table(dff$hotel_name), decreasing=TRUE)[1:5])
+popular_hotel <- dff %>%
+filter(hotel_name %in% popular_hotel_names) %>%
+group_by(hotel_name, rating_category) %>%
+summarize(count = n())
+
+ggplot(popular_hotel, aes(x=hotel_name, y=count, fill=rating_category)) +
+  geom_bar(stat='identity', position=position_stack(reverse = T)) +
+  geom_text(aes(label=as.character(count)),
+  color = 'white', position=position_stack(reverse = T, vjust=0.5)) +
+  labs(title = "Number of Ratings of TOP5 Hotel",
+  x = "", y = "", fill = "Rating") +
+  guides(fill = guide_legend(reverse = T)) +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+The hotel is more or less active based on the number of its appearances in the
+dataset.
+
+The size is scaled with the count it represents. The labels of counts that are 
+below 6 are disregarded because they are not that significant and look
+ugly on the plot.
+
+The hotels with the highest numbers of reviews are Hotel Minsk,Hygge, Pentahotel Leuven, The Helmet Hotel
+and Warwick Brussels - Grand Place. The most active hotel is Hygge with the highest numbers of 10s and 9s. What is
+interesting to note is that Grand Place has all of its ratings above 5. Regarding The Helmet Hotel, it has a little bit more than
+100 reviews and all counts for its ratings are somewhat close to each other and the distribution of ratings of this hotel is different from the others.
+
+
+
+Now, let's explore the distribution of average ratings by hotel. We'll calculate the mean rating per hotel and visualize it using a histogram.
+
+```{r}
+# Get average rating by hotel
+average_ratings <- dff %>% 
+  group_by(hotel_name) %>%
+  summarise(avg_rating = mean(rating)) %>%
+  arrange(desc(avg_rating))
+
+# Bar chart for average rating by hotel
+ggplot(data=average_ratings, aes(x=avg_rating)) +
+  geom_histogram(breaks = seq(4,10,by=0.25), fill = "#F8B195", color = "#F09571") +
+  xlab("Average Rating") +
+  ylab(" ") + 
+  ggtitle("Number of hotels by Ratings") +
+  scale_x_continuous(breaks = c(4:10)) + 
+  theme_minimal()
+
+```
+
+The histogram shows that none of the hotels has an average rating below 4. Most of the average ratings fall within 8 to 10, that is, the average rating is quite high for the selection of hotels. There appears to be a sudden drop in the number of hotels with an average rating of 9, which, however, might be attributed to the small sample size.
+
+
+Next, we can try to understand the distribution of reviews and reviewers per country. To do so, let's count the reviews and reviewers for each country and make choropleth maps.
+
+```{r}
+# Get number of reviews per country
+reviews_per_country <- dff %>% 
+  group_by(nationality) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count))
+
+world <- gisco_get_countries()
+map_data <- merge(world, reviews_per_country, by.x = "NAME_ENGL",
+                  by.y = "nationality", all.x = TRUE)
+
+# Choropleth map for number of reviews per country
+ggplot() +
+  geom_sf(data = map_data, aes(fill = count)) +
+  scale_fill_continuous(breaks = c(0, 10, 20, 50, 100, 500),
+                        labels = c("0", "10", "20", "50", "100", "500"),
+                        low = "#ffeac6", high = "#97312d", trans = "log") +
+  labs(title = "Number of Reviews per Country", fill = "Number of Reviews") +
+  theme_minimal() 
+
+```
+
+The map indicates that Europe, North America, and Australia have greater number of reviews compared to the rest of the world. The United Kingdom leads with more than half a thousand reviews. Now, let's proceed to the number of reviewers.
+
+
+```{r}
+# Get number of reviewers per country
+reviewers_per_country <- dff %>%
+  distinct(reviewed_by, nationality) %>%
+  group_by(nationality) %>%
+  summarise(count = n())
+  
+map_data <- merge(world, reviewers_per_country, by.x = "NAME_ENGL",
+                  by.y = "nationality", all.x = TRUE)
+
+# Choropleth map for number of reviewers per country
+ggplot() +
+  geom_sf(data = map_data, aes(fill = count)) +
+  scale_fill_continuous(breaks = c(0, 10, 20, 50, 100, 300),
+                        labels = c("0", "10", "20", "50", "100", "300"),
+                        low = "#ffeac6", high = "#97312d", trans = "log") +
+  labs(title = "Number of Reviewers per Country", fill = "Number of Reviews") +
+  theme_minimal() 
+
+```
+
+This map is similar to the previous one, as it is expected that countries with a high number of reviews will also have a substantial number of reviewers. Once again, Europe, North America, and Australia stand out with a significant number of reviews.
+
+We can further analyze the duration of stays using the tags connected with each review. For that, we'll need to extract the tags and count the distribution of stay durations.
+
+```{r}
+# Count for number of nights stayed
+tags_df <- dff %>%
+  separate_rows(tags, sep = "~") %>%
+  filter(!is.na(tags))
+
+tag_counts <- tags_df %>%
+  group_by(tags) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count))
+
+stay_tags <- tag_counts %>%
+  filter(grepl("^Stayed (\\d+) nights*$", tags)) %>%
+  mutate(nights = as.numeric(gsub("\\D", "", tags))) %>%
+  mutate(nights_grouped = ifelse(nights >= 10, "10+", as.character(nights))) %>%
+  group_by(nights_grouped) %>%
+  summarise(stays=sum(count))
+
+
+# Order the nights stayed
+stay_tags$nights_grouped <- ordered(stay_tags$nights_grouped,
+                                    levels = c("1", "2", "3", "4", "5", "6",
+                                               "7", "8", "9", "10+"))
+
+# Barchart for the number of nights stayed
+ggplot(stay_tags, aes(x = nights_grouped, y = stays)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Number of Stays by Duration",
+  x = "Stay Duration (in nights)",
+  y = "Number of Stays") +
+  theme_minimal()
+```
+
+The bar chart reveals a preference for shorter stays, with approximately 1500 reviews indicating one-night stays and around half as many featuring two-night stay tags. The number of three-night stays is half as much as two-night stays, and this pattern seems to continue. stays of 6 or more days appear to be not popular according to the review tags.
+
+Now, let's analyze the ratings. Dividing the ratings into groups, we can make a pie chart and form an understanding of the distribution of ratings.
+
+```{r}
+# Rating groups
+bins <- c(0, 6, 7, 8, 9, 10.1)
+labels <- c('0-6', '6-7', '7-8', '8-9', '9-10')
+
+# Add rating categories according to groups
+dff$rating_category <- cut(dff$rating, breaks=bins, labels=labels, right=F)
+
+# Pie chart with rating percentages
+ggplot(dff, aes(x = "", fill = rating_category)) +
+  geom_bar() +
+  geom_text(aes(label = scales::percent(after_stat(count)/sum(after_stat(count)))),
+            position = position_stack(vjust=0.5), stat = "count", size = 2.5) +
+  coord_polar(theta="y", direction = -1) +
+  theme_void() +
+  labs(title = "Distribution of Ratings",
+       fill = "Rating") +
+  theme(axis.text.x = element_blank())
+
+```
+
+
+
+The pie chart illustrates that 50% of the reviews fall within the 9-10 rating range. Ratings in the [8,9) range make up 20.9%, while 7-8 ratings constitute 17.3%. Reviews with a rating of less than 7 account for 11.7%. Consequently, the majority of ratings are quite positive To explore further, we can reorganize the rating groups for additional analysis.
+
+```{r}
+# Rating groups
+bins <- c(0, 7, 9, 10.1)
+labels <- c('0-7', '7-9', '9-10')
+
+# Add rating categories according to groups
+dff$rating_category <- cut(dff$rating, breaks=bins, labels=labels, right=F)
+
+# Pie chart with rating percentages
+ggplot(dff, aes(x = "", fill = rating_category)) +
+  geom_bar() +
+  geom_text(stat = "count",size = 4, aes(label = scales::percent(after_stat(count)/sum(after_stat(count)))),
+            position = position_stack(vjust=0.5)) +
+  coord_polar(theta="y", direction = -1) +
+  theme_void() +
+  labs(title = "Distribution of Ratings",
+       fill = "Rating") +
+  theme(axis.text.x = element_blank())
+
+```
+
+Now dividing into bigger categories 0-7, 7-8, and 9-10 to perform a trivial Net Performance Score Analysis (since the review numbers can be floats, a slight modifications are made in group classification ranges). It measures how likely it is that a customer will act as a
+brand ambassador and promote the products/services/company.The customers are divided into 3 groups. First Group or Promoters include the customers whose ratings fall within the 9-10 rating range; this group will recommend the service to others. The neutral group or Passives, have ratings from 7-9,and are satisfied with the services but won't necessarily recommend. This group will likely not have any impact on the business. Finally, Detractors, having ratings below 7 are the ones who were unsatisfied with the services and will discourage others to use them. This group can and will harm the business status.
+
+Obtaining the numbers of each group from the Pie Chart, NPM can be easily calculated:
+
+NPS = % of Promoters - % of Detractors = 50% - 12 % = 38% which is positive, meaning the reviews of the customers in average have a positive impact on the hotels.
+
+If the information regarding the demographics of hotels were present, further analysis could be implemented by grouping hotels into bigger groups and comparing whether a certain group is doing better or worse according to global average.
+
+
+Now, let's explore the average number of reviews per reviewer. We’ll count the number of reviews per reviewer and then look at its distribution.
+
+
+```{r}
+# Get count of reviewers
+reviewers <- dff %>% 
+  group_by(reviewed_by) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count))
+
+# Get number of reviews per reviewer
+num_reviews <- reviewers %>%
+  mutate(count = ifelse(count >= 10, "10+", as.character(count))) %>%
+  group_by(reviews=count) %>%
+  summarise(count=n())
+
+# Order the groups
+num_reviews$reviews <- ordered(num_reviews$reviews,
+                               levels = c("1", "2", "3", "4", "5", "6",
+                                          "7", "8", "9", "10+"))
+
+# Bar chart for number of reviews per reviewer
+ggplot(num_reviews, aes(x = reviews, y = count)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  labs(title = "Number of Reviews by Reviewer",
+       x = "Number of Reviews",
+       y = "Number of Reviewers") +
+  theme_minimal()
+
+```
+
+Most reviewers tend to leave only one review, with a smaller number contributing more than two.
+
+To explore further, let's examine if there are patterns in the number of reviews across months and weekdays. We’ll first count the number of reviews left by months and weekdays and plot the distribution.
+
+```{r}
+dff$reviewed_at <- as.Date(dff$reviewed_at)
+
+# Get number of reviews per month
+dates_month <- dff %>% 
+  group_by(month=month(reviewed_at, label = TRUE, abbr = TRUE)) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count))
+
+# Get number of reviews per weekday
+dates_weekday <- dff %>% 
+  group_by(weekday=weekdays(reviewed_at)) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count))
+
+# Order the weekdays chronologically
+dates_weekday$weekday <- factor(dates_weekday$weekday,
+                                levels = c("Monday", "Tuesday", "Wednesday",
+                                           "Thursday", "Friday", "Saturday",
+                                           "Sunday"))
+```
+
+
+```{r}
+# Bar chart of reviews per month
+ggplot(dates_month, aes(x = month, y = count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Number of Reviews By Month",
+       x = "",
+       y = "Number of Reviews") +
+  theme_minimal() +
+  scale_x_discrete(labels = month.abb)
+```
+
+The bar chart indicates that August, September, and October stand out as the months with the highest review activity, typically associated with the peak travel season.
+Now, let's examine the distribution of reviews based on weekdays.
+
+```{r}
+# Bar chart of reviews per weekday
+ggplot(dates_weekday, aes(x = weekday, y = count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Number of Reviews By The Days Of Week",
+       x = "",
+       y = "Number of Reviews") +
+  theme_minimal()
+```
+
+The data reveals that Sunday and Monday are the preferred weekdays for submitting reviews, suggesting that weekends are the prime time for hotel stays and subsequent feedback.
+
+## Analysis with Word Clouds 
+
+Since the reviews consist of textual data, using word clouds helps us identify the most common words.
+
+```{r, warning = FALSE}
+corpus <- Corpus(VectorSource(dff$review_text))
+corpus <- tm_map(corpus, content_transformer(tolower))
+corpus <- tm_map(corpus, removePunctuation)
+corpus <- tm_map(corpus, removeNumbers)
+corpus <- tm_map(corpus, removeWords, stopwords("english"))
+corpus <- tm_map(corpus, stripWhitespace)
+wordcloud(words = dff$review_title, min.freq = 10, 
+          scale = c(3, 0.5), colors = brewer.pal(8, "Set2"))
+title("Most Common Words in Review Title")
+
+```
+
+The word cloud illustrates that the most frequently used words are highly positive (e.g., good, exceptional, superb). This aligns with our earlier findings indicating consistently high ratings. These "positive" words that are so prevalent in the titles have the potential to attract new customers who try to understand the hotel is worth the stay or not. Now, let's delve into the analysis of tags associated with each review.
+
+```{r, warning=FALSE}
+# Word cloud for tags
+wordcloud(words = tag_counts$tags, freq = tag_counts$count, 
+          colors = brewer.pal(8, "Dark2"), min.freq = 25)
+par(mar = c(3, 3, 3, 3))
+title("Most Common Tags in Review Tags")
+```
+
+The tag "Leisure trip" stands out as the most commonly used, meaning the hotels can potentially appeal new customers with this interests, since these tag will appear more when doing the research for a good hotel. Short stays, lasting for one or two nights, are also prevalent. The word cloud further highlights the popularity of solo travel and business trips. 
+
+
+
+Now analyzing the relationship between the length of the review text and the rating. 
+```{r}
+# Relationship between review length and rating
+
+ggplot(dff, aes(x = rating, y = lengths(strsplit(review_text, "\\s+")))) +
+  geom_jitter(color = "purple") +
+  labs(title="Review Length vs. Rating", x="Rating", y="Review Length (words)") +
+  theme_minimal() +
+  scale_x_continuous(breaks=1:10)
+```
+
+
+We see that the review lengths generally show little variation; although, we see that there are no lengthy reviews among the negative ones (with ratings below 7). On the other hand, certain positive reviews (with ratings exceeding 7) tend to be more extensive. This can be explained with the fact that these people are giving more detailed feedback about each aspect of the hotel. 
+
+## Sentiment Analysis with Python 
+
+VADER and Sentiment Analysis
+VADER is a Python dictionary with keys ‘neg’, ‘neu’, ‘pos’ — which correspond to Negative, Neutral, and Positive sentiments.
+
+```{python}
+import pandas as pd
+import matplotlib.pyplot as plt
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+import calendar
+import seaborn as sns
+n = 7
+```
+
+```{python}
+# Load data
+hotel_data = pd.read_csv('booking_reviews copy.csv', parse_dates = ['reviewed_at'])
+
+# Get our hotels
+hotel_counts = hotel_data['hotel_name'].value_counts().reset_index()
+hotel_counts = hotel_counts.sort_values(['count', 'hotel_name'],
+                                        ascending=[False, True])
+my_hotels = hotel_counts.iloc[n::8]["hotel_name"]
+
+# Filter the hotels
+dff = hotel_data[hotel_data['hotel_name'].isin(my_hotels)]
+
+```
+
+```{python}
+# Initialize the sentiment analysis object
+sid_obj = SentimentIntensityAnalyzer()
+
+# Define a function to extract sentiment scores
+def get_sentiment_scores(text):
+  scores = sid_obj.polarity_scores(text)
+  return {
+      "compound": scores["compound"],
+      "positive": scores["pos"],
+      "negative": scores["neg"],
+      "neutral": scores["neu"]
+    }
+    
+sentiment_scores = dff["review_text"].apply(get_sentiment_scores)
+dff = pd.concat([dff, pd.DataFrame(sentiment_scores.tolist(),
+                  index=dff.index)], axis=1)
+```
+
+
+```{python}
+# Compute average sentiment scores
+average_scores = dff.groupby('rating').agg({
+  'compound': 'mean',
+  'positive': 'mean',
+  'negative': 'mean',
+  'neutral': 'mean'
+  }).reset_index()
+```
+
+#Analyzing the relationship between the Sentiments and the Ratings 
+
+1. Positive Sentiment vs Rating 
+
+```{python}
+plt.clf();
+plt.plot(average_scores["rating"], average_scores["positive"]);
+plt.xlabel('Rating');
+plt.ylabel('Positive Scores');
+plt.title('Positive Scores vs Rating');
+plt.xticks(range(1, 11));
+plt.show();
+```
+The positive scores increase as the number of stars increase, which is common sense. However there are some dips in the chart. Still it is a positive relationship.
+
+Negative Sentiment vs Rating
+```{python}
+plt.clf();
+plt.plot(average_scores["rating"], average_scores["negative"]);
+plt.xlabel('Rating');
+plt.ylabel('Negative Scores');
+plt.title('Negative Scores vs Rating');
+plt.xticks(range(1, 11));
+plt.show();
+```
+Subsequently, when plotting stars vs. negative sentiment, it is observed that negative scores decrease as the number of stars increases.
+
+Neutrals vs Rating
+```{python}
+plt.clf();
+plt.plot(average_scores["rating"], average_scores["neutral"]);
+plt.xticks(range(1, 11));
+plt.xlabel('Rating');
+plt.ylabel('Neutral Scores');
+plt.title('Neutral Scores vs Rating');
+plt.show();
+```
+
+
+Compounds 
+
+-a positive sentiment, compound ≥ 0.05
+-a negative sentiment, compound ≤ -0.05
+-a neutral sentiment, the compound is between [-0.05, 0.05]
+
+```{python}
+plt.clf();
+plt.plot(average_scores["rating"], average_scores["compound"]);
+plt.xticks(range(1, 11));
+plt.xlabel('Rating');
+plt.ylabel('Compund Scores');
+plt.title('Compound Scores vs Rating');
+plt.show();
+```
+From the classifications, compound score plot also explains he relationship between the review text and the rating. However there is a major dip between rating 6 and 7. This is a limitation of VADER to acknowledge, as it takes the words separately not the context in which they are used. Still, the major part of the data can be explained with the help of VADER. 
+
+
+## Sentiment Analysis with NRC
+```{r, warning=FALSE}
+sentiments <- get_sentiments("nrc")
+
+# Tokenize the review_text
+tokenized_reviews <- dff %>%
+  filter(rating < 5) %>%
+  unnest_tokens(word, review_text) 
+
+# Perform sentiment analysis on tokenized review_text
+sentiment_analysis <- tokenized_reviews %>%
+  inner_join(sentiments, by=c("word"))
+
+# Count the occurrences of each sentiment
+emotion_counts <- sentiment_analysis %>%
+  group_by(sentiment) %>%
+  summarise(count=n())
+
+# Bar chart of the analysis results
+ggplot(emotion_counts, aes(x=reorder(sentiment, -count), y=count)) +
+  geom_bar(stat="identity", fill="#73729b") +
+  labs(title="Emotions in Review Texts",
+       x="Emotion", y="# of words") +
+  theme_minimal()
+```
+
+
+
+```{r, warning = FALSE}
+# Tokenize the review_text (negative; rating < 6)
+tokenized_reviews_negative <- dff %>%
+  filter(rating < 6) %>%
+  unnest_tokens(word, review_text)
+
+# Perform sentiment analysis on tokenized review_text
+sentiment_analysis_negative <- tokenized_reviews_negative %>%
+  inner_join(sentiments, by=c("word"))
+
+# Count the occurrences of each sentiment
+emotion_counts_negative <- sentiment_analysis_negative %>%
+  group_by(sentiment) %>%
+  summarise(count=n())
+
+# Bar chart of the analysis results
+ggplot(emotion_counts_negative, aes(x=reorder(sentiment, -count), y=count)) +
+  geom_bar(stat="identity", fill="#73729b") +
+  labs(title="Emotions in Review Texts (rating < 6)",
+       x="Emotion", y="# of words") +
+  theme_minimal()
+```
+
+
+
+```{r}
+# Tokenize the review_text (negative; rating >= 6)
+tokenized_reviews_positive <- dff %>%
+  filter(rating >= 6) %>%
+  unnest_tokens(word, review_text) 
+
+# Perform sentiment analysis on tokenized review_text
+sentiment_analysis_positive <- tokenized_reviews_positive %>%
+  inner_join(sentiments, by=c("word"))
+
+# Count the occurrences of each sentiment
+emotion_counts_positive <- sentiment_analysis_positive %>%
+  group_by(sentiment) %>%
+  summarise(count=n())
+
+# Bar chart of the analysis results
+ggplot(emotion_counts_positive, aes(x=reorder(sentiment, -count), y=count)) +
+  geom_bar(stat="identity", fill="#73729b") +
+  labs(title="Emotions in Review Texts (rating >= 6)",
+       x="Emotion", y="# of words") +
+  theme_minimal()
+```
+
